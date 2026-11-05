@@ -9,7 +9,45 @@ def tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9$]+", text.lower())
 
 
-# Build the BM25 keyword index once per vector store, over the same chunks stored in FAISS
+# Glossary: guest wording -> policy wording, added to the query before searching
+SYNONYMS = {
+    r"\b(loud|noise|noisy|party|music)\b": "noise disturbance quiet hours complaint",
+    r"\b(leave|stay|check ?out)\b.*\b(late|later|\d{1,2} ?pm)\b|\blate check ?out\b": "late departure late checkout fee",
+    r"\b(arrive|check ?in)\b.*\b(early|\d{1,2} ?am)\b|\bearly check ?in\b": "early arrival",
+    r"\b(ota|expedia|booking\.com|travel agency|third[- ]party)\b": "online travel agency",
+    r"\b(hold|pending|authorization|deposit)\b": "incidentals authorization release",
+    r"\b(smok|vap)": "smoking vaping remediation charge",
+}
+
+# Property rows look like "Property: ASH-DEN Union, Denver CO; ..." -> map "denver" to "ASH-DEN Union"
+PROPERTY_ROW = re.compile(r"Property: (ASH-[A-Z]+ [A-Za-z ]+?), ([A-Za-z ]+) [A-Z]{2};")
+
+def build_property_map(chunks) -> dict:
+    property_map = {}
+    for c in chunks:
+        m = PROPERTY_ROW.search(c.page_content)
+        if m:
+            property_map[m.group(2).strip().lower()] = m.group(1)
+    return property_map
+
+
+def expand_query(query: str, property_map: dict) -> str:
+    q, extra = query.lower(), []
+
+    # City or hotel name -> property code, only when the code is not already in the question
+    for city, prop in property_map.items():
+        code, name = prop.split()[0].lower(), prop.split()[1].lower()
+        if (city in q or name in q) and code not in q:
+            extra.append(prop)
+
+    for pattern, terms in SYNONYMS.items():
+        if re.search(pattern, q):
+            extra.append(terms)
+
+    return query + (" (" + "; ".join(extra) + ")" if extra else "")
+
+
+# Build the BM25 keyword index and the property map once per vector store, over the same chunks stored in FAISS
 _bm25_cache = {}
 
 def get_bm25(vectorstore):
@@ -18,13 +56,17 @@ def get_bm25(vectorstore):
             vectorstore.docstore.search(vectorstore.index_to_docstore_id[i])
             for i in range(vectorstore.index.ntotal)
         ]
-        _bm25_cache[id(vectorstore)] = (BM25Okapi([tokenize(c.page_content) for c in chunks]), chunks)
+        bm25 = BM25Okapi([tokenize(c.page_content) for c in chunks])
+        _bm25_cache[id(vectorstore)] = (bm25, chunks, build_property_map(chunks))
     return _bm25_cache[id(vectorstore)]
 
 
 # Retrieve the top-k relevant chunks with hybrid search (semantic + keyword, merged with RRF)
 def retrieve(query: str, k: int = 2, vectorstore=None, n_candidates: int = 20, rrf_c: int = 60) -> list[str]:
-    bm25, chunks = get_bm25(vectorstore)
+    bm25, chunks, property_map = get_bm25(vectorstore)
+
+    # Add policy wording and property codes to the question (the original question is kept)
+    query = expand_query(query, property_map)
 
     # Semantic ranking from FAISS
     semantic = vectorstore.similarity_search(query, k=n_candidates)
