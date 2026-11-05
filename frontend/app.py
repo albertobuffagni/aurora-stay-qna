@@ -33,7 +33,7 @@ with st.sidebar:
         "k (chunks to retrieve)",
         min_value=1,
         max_value=10,
-        value=2,
+        value=5,
         help="Number of relevant chunks fetched from the vector store."
     )
 

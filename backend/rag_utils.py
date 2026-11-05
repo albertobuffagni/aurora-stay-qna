@@ -1,10 +1,47 @@
 
 from langchain_openai import ChatOpenAI
+from rank_bm25 import BM25Okapi
 import os
+import re
 
-# Retrieve the top-k relevant chunks from the vector store
-def retrieve(query: str, k: int = 2,vectorstore=None) -> list[str]:
-    results = vectorstore.similarity_search(query, k=k)
+# Split text into lowercase words for BM25 keyword matching
+def tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9$]+", text.lower())
+
+
+# Build the BM25 keyword index once per vector store, over the same chunks stored in FAISS
+_bm25_cache = {}
+
+def get_bm25(vectorstore):
+    if id(vectorstore) not in _bm25_cache:
+        chunks = [
+            vectorstore.docstore.search(vectorstore.index_to_docstore_id[i])
+            for i in range(vectorstore.index.ntotal)
+        ]
+        _bm25_cache[id(vectorstore)] = (BM25Okapi([tokenize(c.page_content) for c in chunks]), chunks)
+    return _bm25_cache[id(vectorstore)]
+
+
+# Retrieve the top-k relevant chunks with hybrid search (semantic + keyword, merged with RRF)
+def retrieve(query: str, k: int = 2, vectorstore=None, n_candidates: int = 20, rrf_c: int = 60) -> list[str]:
+    bm25, chunks = get_bm25(vectorstore)
+
+    # Semantic ranking from FAISS
+    semantic = vectorstore.similarity_search(query, k=n_candidates)
+
+    # Keyword ranking from BM25
+    scores = bm25.get_scores(tokenize(query))
+    keyword = [chunks[i] for i in sorted(range(len(chunks)), key=lambda i: -scores[i])[:n_candidates]]
+
+    # Reciprocal Rank Fusion: add 1 / (rrf_c + rank) from each ranking
+    fused, docs_by_key = {}, {}
+    for ranking in (semantic, keyword):
+        for rank, doc in enumerate(ranking):
+            key = (doc.metadata.get("source"), doc.page_content)
+            fused[key] = fused.get(key, 0) + 1 / (rrf_c + rank + 1)
+            docs_by_key[key] = doc
+
+    results = [docs_by_key[key] for key in sorted(fused, key=fused.get, reverse=True)[:k]]
 
     # Return each chunk with its content and metadata
     return [
@@ -14,6 +51,24 @@ def retrieve(query: str, k: int = 2,vectorstore=None) -> list[str]:
 
 # Define the generation function that prompts the LLM with retrieved context
 def generate(query, retrieved_chunks,model) -> str:
+
+    rules = """
+    1. Use ONLY the information in the Retrieved Policy Information. Do not use outside knowledge or assumptions.
+    2. Answer the specific question directly in the first sentence, then add only the supporting details needed.
+    3. Include every relevant amount, time, deadline, property code and limit exactly as written in the sources.
+    4. Include the conditions, exceptions and approvals that apply (e.g. "subject to availability",
+       "the reservation confirmation controls", service animals vs. pets).
+    5. If the question mentions a specific property (e.g. ASH-MIA Brickell), only give values for that property.
+       If it mentions several properties, answer for each one separately.
+    6. Do not include policy information that is not related to the question.
+    7. Do not invent fees, refund rules, times or procedures that are not in the retrieved information.
+    8. If the retrieved information is insufficient to answer fully, say exactly what is missing:
+       "The available policy documents do not contain enough information to answer this question."
+       If only part of the answer is supported, answer that part and state what could not be confirmed.
+    9. If the retrieved sources conflict, mention the conflict instead of choosing one.
+    10. End with a short "Source:" line naming the document(s) the answer came from.
+    11. Keep the answer concise, professional and easy for hotel staff to read to a guest.
+    """
 
     prompt = f"""
     You are an AI assistant answering questions about hotel policies.
@@ -25,18 +80,7 @@ def generate(query, retrieved_chunks,model) -> str:
     {retrieved_chunks}
 
     Rules:
-    1. Use only information explicitly supported by the retrieved policy information.
-    2. Do not use outside knowledge, assumptions, or information not present in the retrieved policy information.
-    3. Include all relevant information needed to answer the query completely.
-    4. Do not omit important conditions, exclusions, limitations, exceptions, or coverage details.
-    5. Focus only on information directly relevant to the user's query.
-    6. Do not include unrelated information from the retrieved policy information.
-    7. Answer the user's specific question directly and ensure the response addresses what was asked.
-    8. Keep the answer concise, clear, and easy to understand.
-    9. Do not invent benefits, exclusions, limits, waiting periods, conditions, or coverage details.
-    10. If the information is insufficient, say:
-        "The available policy documents do not contain enough information to answer this question."
-        If the retrieved information conflicts, clearly mention the conflict.
+    {rules}
 
     Answer:
     """
@@ -46,7 +90,7 @@ def generate(query, retrieved_chunks,model) -> str:
 # Define the full RAG pipeline combining retrieval and generation
 def rag(
     query: str,
-    k: int = 2,
+    k: int = 5,
     model_name: str = "gpt-4o-mini",
     temperature: float = 0.0,
     top_p: float = 1.0,
